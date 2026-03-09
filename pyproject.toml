@@ -1,0 +1,16 @@
+[project]
+name = "systematic-trading"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "nautilus-trader>=1.224.0",
+    "requests>=2.32.5",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.5",
+    "stubgen-pyx>=0.2.3",
+]
