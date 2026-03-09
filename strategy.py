@@ -3,10 +3,14 @@
 import pandas as pd
 from nautilus_trader.accounting.accounts.base import Account
 from nautilus_trader.cache import Cache
-from nautilus_trader.model import Bar, Currency, Money
-from nautilus_trader.model.enums import OrderSide, PriceType
+from nautilus_trader.config import StrategyConfig
+from nautilus_trader.model import Bar, BarType, Currency, Money, Position
+from nautilus_trader.model.enums import OrderSide, PriceType, TimeInForce
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.objects import Quantity
+from nautilus_trader.model.orders.market import MarketOrder
+from nautilus_trader.trading.strategy import Strategy
+from synthetic_forecasts import generate_synthetic_forecasts
 
 LONG_TERM_FORECAST_AVERAGE = 10
 FORECAST_CAP = 20
@@ -172,3 +176,127 @@ class VolTargetingCalculator:
             "instrument_volatility_scalar": self.volatility_scalar(),
             "subsystem_position": self.subsystem_position(),
         }
+
+
+class VolTargetingStrategyConfig(StrategyConfig, frozen=True):
+    """Configuration for the VolTargetingStrategy."""
+    bar_type: BarType
+    """Bar type to subscribe to, e.g., AAPL.US-1-DAY-LAST-EXTERNAL."""
+    target_risk: float = 0.12
+    """Annualized target risk for the portfolio, e.g., 0.12 for 12%."""
+    forecast_average: float = LONG_TERM_FORECAST_AVERAGE
+    """Long-term average of the absolute value of the forecast, used for scaling.
+    Default is 10, which means that a forecast of +10 means a buy signal, -10 means a sell signal,
+    and 0 means we should not take any position. Forecasts above the forecast average indicate a strong signal,
+    while forecasts below the forecast average indicate a weak signal."""
+    forecast_cap: float = FORECAST_CAP
+    """Cap for the forecast. Default is 20, which means that any forecast above 20 will be treated as 20,
+    and any forecast below -20 will be treated as -20. Useful to avoid taking excessively large positions
+    in case of extreme forecasts."""
+
+
+class VolTargetingStrategy(Strategy):
+    """A simple systematic trading strategy that demonstrates how to use the Nautilus Trader framework.
+
+    The strategy generates forecasts for the subscribed instruments and uses volatility targeting
+    to determine optimal position sizes.
+    It then compares with the current position and submits market orders to adjust the position accordingly.
+
+    Notes:
+        - The strategy supports trading a single instrument for now.
+        - Current forecasts are synthetic and thus completely unrelated to the actual prices movements.
+    """
+    def __init__(self, config: VolTargetingStrategyConfig) -> None:
+        """Initialize the strategy with the given configuration."""
+        super().__init__(config)
+        self.activity = []
+
+    def on_start(self):
+        """Start strategy."""
+        self.subscribe_bars(self.config.bar_type)
+
+    def on_bar(self, bar):
+        """Receive new bar data and act on it."""
+        self.act(bar)
+
+    def act(self, bar: Bar) -> None:
+        """Act on the newly arrived data."""
+        # Get forecast for each traded instrument (currently single instrument only)
+        # The forecast should be a signal of how likely it is for the price to change
+        # in the direction of the forecast (positive = buy signal, negative = sell signal).
+        forecasts = generate_synthetic_forecasts(
+            instruments=[bar.bar_type.instrument_id.value],
+            seed=int(bar.ts_event) % (2**31 - 1),
+            scale=self.config.forecast_average,
+            cap=self.config.forecast_cap,
+        )
+
+        # Negative forecasts mean short positions. We do not support this yet (CASH account).
+        for k in forecasts:
+            if forecasts[k] < 0:
+                forecasts[k] = 0
+
+        # Wait for 30 bars to have (more than) enough data to calculate volatility before trading.
+        if len(self.cache.bars(self.config.bar_type)) < 30:
+            self.log.info("Hydrating bars for volatility calculations...")
+            return
+
+        instrument: Instrument = self.cache.instrument(self.config.bar_type.instrument_id)
+        calculator = VolTargetingCalculator(
+            self.cache,
+            instrument,
+            bar,
+            25,
+            self.config.target_risk,
+            forecasts[bar.bar_type.instrument_id.value],
+            self.config.forecast_average,
+        )
+
+        positions: list[Position] = self.cache.positions(instrument_id=instrument.id)
+        assert len(positions) <= 1, "Current system supports trading only a single instrument"
+
+        optimal_position, side = calculator.subsystem_position()
+        signed_pos = optimal_position.as_double() if side == OrderSide.BUY else -optimal_position.as_double()
+        should_trade = True
+
+        # If a position is open, calculate the difference between the optimal position and the current position,
+        # and trade the difference.
+        if len(positions) > 0:
+            current_position = positions[0]
+            signed_pos = signed_pos - current_position.signed_qty
+            side = OrderSide.BUY if signed_pos > 0 else OrderSide.SELL
+            if (instrument.notional_value(Quantity(int(abs(signed_pos)), 0), bar.close) >= calculator.balance
+                and side == OrderSide.BUY):
+                self.log.warning(f"Notional value of trade greater than current balance. Leverage required,"
+                                 f" but not supported in CASH account. Skipping trade."
+                                 f" Trade: {instrument.notional_value(Quantity(int(abs(signed_pos)), 0), bar.close)},"
+                                 f" balance: {calculator.balance}")
+                self.log.warning(f"Printing diagnostics:\n{calculator.diagnostics()}")
+                should_trade = False
+
+        if should_trade and int(abs(signed_pos)) > 0:
+            order: MarketOrder = self.order_factory.market(
+                instrument_id=instrument.id,
+                order_side=side,
+                quantity=Quantity(int(abs(signed_pos)), 0),
+                time_in_force=TimeInForce.GTC,
+            )
+            self.submit_order(order)
+
+        # TODO:
+        # - Multiple instruments: calculate weights across multiple instruments using standard optimization.
+        # - Apply position inertia (e.g., trade only if diff in positions > threshold).
+        # - Apply commissions (and slippage).
+        # - Multi-currency balances. Fx data needed.
+
+        diagnostics = calculator.diagnostics()
+        del diagnostics["subsystem_position"]
+        diagnostics["order_side"] = side
+        diagnostics["difference"] = signed_pos
+        diagnostics["optimal_position"] = optimal_position.as_double()
+        self.activity.append(diagnostics)
+
+    def on_stop(self):
+        """Stop strategy."""
+        self.unsubscribe_bars(self.config.bar_type)
+        pd.DataFrame(self.activity).to_csv("activity.csv", index=False)
