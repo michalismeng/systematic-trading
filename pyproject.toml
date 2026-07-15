@@ -5,7 +5,11 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "alpha-vantage>=3.0.0",
+    "lightweight-charts>=2.1",
     "nautilus-trader>=1.224.0",
+    "pyqtwebengine>=5.15.7",
+    "qtpy>=2.4.3",
     "requests>=2.32.5",
 ]
 

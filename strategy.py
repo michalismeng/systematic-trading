@@ -294,6 +294,7 @@ class VolTargetingStrategy(Strategy):
         diagnostics["order_side"] = side
         diagnostics["difference"] = signed_pos
         diagnostics["optimal_position"] = optimal_position.as_double()
+        diagnostics["date"] = pd.to_datetime(bar.ts_event, unit="ns")
         self.activity.append(diagnostics)
 
     def on_stop(self):

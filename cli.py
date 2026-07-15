@@ -178,4 +178,5 @@ class SystematicTradingCLI(cmd.Cmd):
 
 
 if __name__ == "__main__":
-    SystematicTradingCLI().cmdloop()
+    # SystematicTradingCLI().cmdloop()
+    SystematicTradingCLI().onecmd("backtest")
